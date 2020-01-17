@@ -1,0 +1,2 @@
+class SimpleBuildError(Exception):
+    pass
