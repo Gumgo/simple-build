@@ -1,9 +1,11 @@
+import copy
 import importlib.util
 import os
 import pathlib
 import platform
 import sys
 
+from simple_build import engine_accessor
 from simple_build import graph_objects
 from simple_build.simple_build_error import SimpleBuildError
 
@@ -19,6 +21,8 @@ class _Node:
 
 class Engine:
     def __init__(self):
+        engine_accessor.set(self)
+
         # Search up the directory tree for the buildroot file
         self._root_directory = pathlib.Path(".").resolve()
         while not (self._root_directory / _BUILDROOT_NAME).exists():
@@ -43,7 +47,14 @@ class Engine:
 
         # Map of all targets declared at a global scope in a buildfile
         # Maps (buildfile_directory, target_name) -> (Target)
+        # (buildfile_directory, None) is the default target
         self._targets = {}
+
+        # Maps (operation_type) -> OperationSettings
+        self._operation_default_settings = {}
+
+        # Maps (buildfile_directory, operation_type) -> OperationSettings
+        self._buildfile_operation_default_settings = {}
 
         # Visit the buildfile in our current directory
         self.visit_buildfile(self._buildfile_directory)
@@ -59,6 +70,60 @@ class Engine:
     def set_config_settings(self, config_settings):
         self._config_settings = config_settings
 
+    # Returns the default settings for the operation type specified for the current buildfile
+    # The default settings can be changed directly by modifying the returned object
+    def get_buildfile_operation_settings(self, operation_type):
+        if not issubclass(operation_type, graph_objects.Operation):
+            raise SimpleBuildError("'{}' is not an Operation".format(str(operation_type)))
+
+        buildfile_directory = self._get_current_buildfile_directory()
+
+        settings = None
+        parent_buildfile_directory = buildfile_directory
+        while settings is None:
+            key = (parent_buildfile_directory, operation_type)
+            settings = self._buildfile_operation_default_settings.get(key, None)
+            if settings is None:
+                parent_buildfile_directory = self._get_parent_buildfile_directory(parent_buildfile_directory)
+                if parent_buildfile_directory is None:
+                    # Use the default settings if we've passed the rootmost buildfile
+                    settings = self._get_default_operation_settings(operation_type)
+
+        key = (buildfile_directory, operation_type)
+        if key not in self._buildfile_operation_default_settings:
+            # Copy the settings if they didn't already exist for the current buildfile
+            settings = copy.deepcopy(settings)
+            self._buildfile_operation_default_settings[key] = settings
+
+        return settings
+
+    # Replaces the default settings for the operation type specified for the current buildfile with the ones provided
+    # This method makes a copy so modifications to the settings object made after calling this method are not saved
+    def set_buildfile_operation_settings(self, operation_type, operation_settings):
+        if not issubclass(operation_type, graph_objects.Operation):
+            raise SimpleBuildError("'{}' is not an Operation".format(str(operation_type)))
+
+        buildfile_directory = self._get_current_buildfile_directory()
+
+        default_settings_type = type(self._get_default_operation_settings(operation_type))
+        if not isinstance(operation_settings, default_settings_type):
+            raise SimpleBuildError(
+                "Settings provided for Operation '{}' is not of type '{}'".format(
+                    str(operation_type),
+                    str(default_settings_type)))
+
+        key = (buildfile_directory, operation_type)
+        self._buildfile_operation_default_settings[key] = copy.deepcopy(operation_settings)
+
+    # Sets the default target to be built if no target is explicitly specified
+    def set_buildfile_default_target(self, default_target):
+        if not issubclass(default_target, graph_objects.Target):
+            raise SimpleBuildError("'{}' is not a Target".format(str(default_target)))
+
+        buildfile_directory = self._get_current_buildfile_directory()
+
+        self._targets[(buildfile_directory, None)] = default_target
+
     # Visit the buildfile in the given path, which should be specified as an absolute path
     def visit_buildfile(self, path):
         try:
@@ -72,7 +137,7 @@ class Engine:
         if relative_path in self._active_buildfile_visits:
             raise SimpleBuildError(
                 "Recursive dependencies detected: {}".format(
-                    " -> ".join(str(x for x in self._active_buildfile_visits + [relative_path]))))
+                    " -> ".join(str(x) for x in self._active_buildfile_visits + [relative_path])))
 
         # Check if we've already visited this module
         module = self._buildfile_modules.get(relative_path, None)
@@ -81,6 +146,13 @@ class Engine:
 
         try:
             self._active_buildfile_visits.append(relative_path)
+
+            # Visit the parent buildfile first
+            # Do this after adding to the active buildfile list so that we can detect cyclic dependencies
+            # (Child buildfiles are implicitly dependent on their parent)
+            parent_buildfile_directory = self._get_parent_buildfile_directory(relative_path)
+            if parent_buildfile_directory is not None:
+                self.visit_buildfile(self._root_directory / parent_buildfile_directory)
 
             # Come up with a unique name for this module
             def sanitize(c):
@@ -115,15 +187,19 @@ class Engine:
         return module
 
     # Builds or cleans a target with the provided target string
+    # The default target is built if target_string is empty
     def build_or_clean_target(self, target_string, clean):
         if len(target_string) == 0:
-            raise SimpleBuildError("No target provided")
-        target_string_components = target_string.replace("\\", "/").split("/")
-        target_path = self._buildfile_directory
-        for path_component in target_string_components[:-1]:
-            target_path = target_path / path_component
-        target_path = target_path.resolve()
-        target_name = target_string_components[-1]
+            # Build the default target
+            target_path = self._buildfile_directory
+            target_name = None
+        else:
+            target_string_components = target_string.replace("\\", "/").split("/")
+            target_path = self._buildfile_directory
+            for path_component in target_string_components[:-1]:
+                target_path = target_path / path_component
+            target_path = target_path.resolve()
+            target_name = target_string_components[-1]
 
         try:
             buildfile_directory = target_path.relative_to(self._root_directory)
@@ -133,7 +209,10 @@ class Engine:
         target_key = (buildfile_directory, target_name)
         target = self._targets.get(target_key, None)
         if target is None:
-            raise SimpleBuildError("The target '{}' was not found".format(target_string))
+            if target_name is None:
+                raise SimpleBuildError("No default target was set")
+            else:
+                raise SimpleBuildError("The target '{}' was not found".format(target_string))
 
         if target.operation is None:
             raise SimpleBuildError("The target '{}' is not the output of any operation".format(target_string))
@@ -218,6 +297,36 @@ class Engine:
 
                 if output_node.unresolved_input_count == 0:
                     ready_nodes.append(output_node)
+
+    def _get_current_buildfile_directory(self):
+        if len(self._active_buildfile_visits) == 0:
+            raise SimpleBuildError("No buildfile is currently active")
+        return self._active_buildfile_visits[-1]
+
+    # buildfile_directory should be relative to the root directory
+    def _get_parent_buildfile_directory(self, buildfile_directory):
+        while True:
+            parent_buildfile_directory = buildfile_directory.parent
+            if buildfile_directory == parent_buildfile_directory:
+                return None
+            buildfile_directory = parent_buildfile_directory
+
+            if (self._root_directory / buildfile_directory / _BUILDFILE_NAME).exists():
+                return buildfile_directory
+
+    # This function queries and caches the default settings if necessary
+    def _get_default_operation_settings(self, operation_type):
+        if not issubclass(operation_type, graph_objects.Operation):
+            raise SimpleBuildError("'{}' is not an Operation".format(str(operation_type)))
+
+        default_settings = self._operation_default_settings.get(operation_type, None)
+        if default_settings is None:
+            default_settings = operation_type.get_default_settings()
+            if not isinstance(default_settings, graph_objects.OperationSettings):
+                raise SimpleBuildError("'{}' is not an OperationSettings".format(str(default_settings)))
+            self._operation_default_settings[operation_type] = operation_type
+
+        return default_settings
 
 def get():
     return _instance
