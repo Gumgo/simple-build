@@ -2,7 +2,6 @@ import copy
 import importlib.util
 import os
 import pathlib
-import platform
 import sys
 
 from simple_build import engine_accessor
@@ -224,8 +223,13 @@ class Engine:
         nodes_for_operations = { target.operation: _Node(target.operation) }
         root_nodes = set()
         operations_path = [] # Used to detect cycles
+        all_targets_operations = set()
         while len(operations_stack) > 0:
             operation = operations_stack.pop()
+            for target in operation.inputs:
+                all_targets_operations.add((target, operation))
+            for target in operation.outputs:
+                all_targets_operations.add((target, operation))
 
             # We push None onto the stack to indicate this operation has been fully visited
             if operation is None:
@@ -256,22 +260,24 @@ class Engine:
                     input_node.output_nodes.add(node)
                     operations_stack.append(input_target.operation)
 
+        # Calculate modification timestamps all at once
+        target_modification_timestamps = dict(((t, o), t.get_modification_timestamp(o)) for t, o in all_targets_operations)
+
         # Now run the graph
         # $TODO multithread this
-        platform_system = platform.system()
         ready_nodes = [x for x in root_nodes]
         while len(ready_nodes) > 0:
             node = ready_nodes.pop()
             assert node.unresolved_input_count == 0
 
-            operation_implementation = node.operation.get_operation_implementation(platform_system)
+            node.operation.activate()
 
             if clean:
-                operation_implementation.clean()
+                node.active_implementation.clean()
             else:
                 input_modification_timestamp = float("-inf")
                 for input_target in operation.inputs:
-                    modification_timestamp = input_target.get_modification_timestamp()
+                    modification_timestamp = target_modification_timestamps[(input_target, node.operation)]
                     if modification_timestamp is None:
                         # If any input target can't provide a modification timestamp, we always run the operation
                         input_modification_timestamp = None
@@ -282,14 +288,14 @@ class Engine:
                 if not stale:
                     for output_target in operation.outputs:
                         # Check to see if the inputs were last modified after any output was last built
-                        modification_timestamp = output_target.get_modification_timestamp()
+                        modification_timestamp = target_modification_timestamps[(output_target, node.operation)]
                         if modification_timestamp is None or input_modification_timestamp > modification_timestamp:
                             # If any output target can't provide a modification timestamp, we always run the operation
                             stale = True
                             break
 
                 if stale:
-                    operation_implementation.run()
+                    node.active_implementation.run()
 
             for output_node in node.output_nodes:
                 output_node.unresolved_input_count -= 1

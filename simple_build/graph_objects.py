@@ -14,7 +14,7 @@ class Target:
     # Returns the last modification timestamp of the target
     # This should be a float representing the number of seconds since the epoch, as returned by os.path.getmtime()
     # None is returned if the target doesn't have a modification timestamp or if it isn't available (e.g. file doesn't exist)
-    def get_modification_timestamp(self):
+    def get_modification_timestamp(self, operation):
         raise NotImplementedError()
 
     # Raises an error if this target is in an invalid state - e.g. a file doesn't exist
@@ -34,6 +34,7 @@ class Operation:
         self._settings_type = type(self._settings)
         self._inputs = []
         self._outputs = []
+        self._active_implementation = None
 
     @staticmethod
     def get_default_settings():
@@ -82,6 +83,14 @@ class Operation:
         self._outputs.append(target)
         target._operation = self
 
+    @property
+    def active_implementation(self):
+        return self._active_implementation
+
+    # Called from the engine - instantiates an implementation
+    def activate(self):
+        self._active_implementation = self.get_operation_implementation()
+
     # nocheckin Call these
     # Raises an error if the input provided is not valid - e.g. providing a py file to a C++ compiler
     def validate_input(self, input):
@@ -91,9 +100,8 @@ class Operation:
     def validate_output(self, output):
         raise NotImplementedError()
 
-    # Returns the operation implementation appropriate for the given platform
-    # platform is the string obtained by calling platform.system()
-    def get_operation_implementation(self, platform):
+    # Returns the operation implementation appropriate for the operation settings
+    def get_operation_implementation(self):
         raise NotImplementedError()
 
 class OperationImplementation:
